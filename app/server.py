@@ -1,0 +1,112 @@
+import os
+import time
+from flask import Flask, render_template, request, jsonify, send_file
+from werkzeug.utils import secure_filename
+import threading
+from engine.extractor import extract_text_from_pdf, get_sentences
+from engine.web_scraper import get_candidate_urls, scrape_all_candidates
+from engine.shingling import calculate_similarity
+from engine.pdf_generator import generate_report_pdf
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['REPORT_FOLDER'] = 'reports'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 # 16MB max
+
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['REPORT_FOLDER'], exist_ok=True)
+
+# Store results in memory
+results_db = {}
+
+def process_document(file_id, filepath, exclude_quotes=True, exclude_biblio=True, exclude_small=False):
+    try:
+        print(f"[!] Mulai ekstraksi teks dari: {filepath}")
+        doc_text = extract_text_from_pdf(filepath, exclude_quotes, exclude_biblio)
+        sentences = get_sentences(doc_text)
+        
+        print(f"[!] Mencari kandidat dari web...")
+        urls = get_candidate_urls(sentences, max_probes=120)
+        
+        print(f"[!] Mengunduh teks dari {len(urls)} kandidat...")
+        corpus = scrape_all_candidates(urls)
+        
+        print("[!] Menghitung similaritas dengan algoritma N-Gram Shingling...")
+        sorted_sources, total_similarity, plagiarized_sentences = calculate_similarity(doc_text, corpus, exclude_small)
+        
+        data = {
+            'filename': os.path.basename(filepath).replace('.pdf', ''),
+            'total_similarity': total_similarity,
+            'sources': sorted_sources,
+            'plagiarized_sentences': plagiarized_sentences
+        }
+        
+        print("[!] Membangun PDF Report...")
+        report_pdf_path = os.path.join(app.config['REPORT_FOLDER'], f"{file_id}_report.pdf")
+        generate_report_pdf(filepath, report_pdf_path, data)
+        
+        results_db[file_id] = {
+            'status': 'completed',
+            'data': data
+        }
+        print(f"[!] Selesai. Hasil: {total_similarity}%")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        results_db[file_id] = {
+            'status': 'error',
+            'message': str(e)
+        }
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    exclude_quotes = request.form.get('exclude_quotes') == 'true'
+    exclude_biblio = request.form.get('exclude_biblio') == 'true'
+    exclude_small = request.form.get('exclude_small') == 'true'
+
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+        
+    if file and file.filename.endswith('.pdf'):
+        filename = secure_filename(file.filename)
+        file_id = f"skripsi_final_{int(time.time() * 1000)}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}.pdf")
+        file.save(filepath)
+        
+        results_db[file_id] = {'status': 'processing'}
+        thread = threading.Thread(target=process_document, args=(file_id, filepath, exclude_quotes, exclude_biblio, exclude_small))
+        thread.start()
+        
+        return jsonify({'file_id': file_id, 'filename': filename})
+    return jsonify({'error': 'Hanya file PDF yang diizinkan'}), 400
+
+@app.route('/status/<file_id>')
+def status(file_id):
+    data = results_db.get(file_id, {'status': 'not_found'})
+    return jsonify(data)
+
+@app.route('/report/<file_id>')
+def report(file_id):
+    if file_id in results_db and results_db[file_id]['status'] == 'completed':
+        data = results_db[file_id]['data']
+        data_for_html = {k:v for k,v in data.items() if k != 'plagiarized_sentences'}
+        return render_template('report.html', data=data_for_html, file_id=file_id)
+    return "Laporan belum siap atau terjadi kesalahan.", 404
+
+@app.route('/download/<file_id>')
+def download_report(file_id):
+    report_pdf_path = os.path.join(app.config['REPORT_FOLDER'], f"{file_id}_report.pdf")
+    if os.path.exists(report_pdf_path):
+        return send_file(report_pdf_path, as_attachment=True, download_name=f"{file_id}_Turnitin_Report.pdf")
+    return "PDF Report not found", 404
+
+if __name__ == '__main__':
+    app.run(port=5001, debug=True)

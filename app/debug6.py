@@ -1,0 +1,2 @@
+from engine.web_scraper import get_candidate_urls
+print(get_candidate_urls(['Machine learning adalah cabang dari kecerdasan buatan', 'Penelitian ini bertujuan untuk menganalisis email spam'], max_probes=2))
